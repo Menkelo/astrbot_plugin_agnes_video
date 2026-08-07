@@ -68,19 +68,14 @@ class AgnesVideo(Star):
         self._key_index = 0
 
     def _resolve_keys(self) -> list[str]:
-        """解析 API Key 列表。
+        """解析 API Key 列表（`api_keys`，每项一个 Key）。
 
-        优先读取 `api_keys`（list，每项一个 Key）；否则读取 `api_key`
-        （支持用英文逗号分隔多个 Key，用于轮询绕过每分钟 1 个视频任务的限流）。
+        多个 Key 时插件会轮询使用，绕过每分钟 1 个视频任务的限流。
         """
         keys: list[str] = []
         for k in self.config.get("api_keys") or []:
             if isinstance(k, str) and k.strip():
                 keys.append(k.strip())
-        if not keys:
-            raw = self.config.get("api_key", "")
-            if isinstance(raw, str):
-                keys = [k.strip() for k in raw.split(",") if k.strip()]
         return keys or []
 
     def _next_key(self) -> str:
@@ -428,6 +423,17 @@ class AgnesVideo(Star):
         """从任务响应中提取最终视频 URL。"""
         return ((data.get("metadata") or {}).get("url")) or data.get("url") or ""
 
+    @staticmethod
+    def _extract_error_message(err: str) -> str:
+        """从错误字符串中提取简短的错误信息。"""
+        m = re.search(r"'message':\s*'([^']*)'", err)
+        if m:
+            return m.group(1).strip()[:200]
+        m = re.search(r"HTTP \d+: (.+)", err)
+        if m:
+            return m.group(1).strip()[:200]
+        return err.strip()[:200]
+
     async def _safe_send(self, umo: str, chain: MessageChain):
         try:
             await self.context.send_message(umo, chain)
@@ -465,7 +471,17 @@ class AgnesVideo(Star):
             try:
                 data = await self._query_task(video_id)
             except Exception as e:  # noqa: BLE001
-                logger.error(f"[AgnesVideo] 查询任务 {video_id} 失败: {e}")
+                err = str(e)
+                logger.error(f"[AgnesVideo] 查询任务 {video_id} 失败: {err}")
+                if re.search(r"HTTP [45]\d\d", err):
+                    message = self._extract_error_message(err)
+                    await self._safe_send(
+                        umo,
+                        MessageChain().message(
+                            f"视频生成失败：{message or '任务已终止'}，请修改提示词后重试。"
+                        ),
+                    )
+                    return
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
                 continue
@@ -502,7 +518,7 @@ class AgnesVideo(Star):
         """创建任务并启动后台轮询。"""
         if not self._api_key_ok():
             yield event.plain_result(
-                "未配置 Agnes AI API Key，请在插件配置中填写 api_key。"
+                "未配置 Agnes API Key，请在插件配置中填写 api_keys 列表。"
             )
             return
         try:

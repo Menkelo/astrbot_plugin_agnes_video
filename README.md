@@ -16,7 +16,7 @@
 
 1. 将插件目录 `astrbot_plugin_agnes_video` 放入 AstrBot 的 `data/plugins/` 目录。
 2. 在 AstrBot WebUI 的「插件管理」中启用插件。
-3. 进入插件配置，填写 Agnes AI API Key（申请地址见 Agnes AI 官网）。
+3. 进入插件配置，在 `api_keys` 列表中填写 Agnes API Key（申请地址见 Agnes AI 官网）。
 
 依赖：`aiohttp`、`Pillow`（requirements.txt 已声明；安装插件时若自动安装失败，请在 AstrBot 环境中执行 `pip install aiohttp Pillow`）。
 
@@ -45,8 +45,7 @@
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `api_key` | 无 | Agnes AI API Key（必填；多个 Key 用英文逗号分隔，插件会轮询使用） |
-| `api_keys` | `[]` | API Key 列表（可选），填了优先用它轮询 |
+| `api_keys` | `[]` | Agnes API Key 列表（必填），每项一个 Key，多个 Key 自动轮询使用 |
 | `base_url` | `https://apihub.agnes-ai.com` | API 网关地址 |
 | `model` | `agnes-video-v2.0` | 视频生成模型 |
 | `aspect_ratio` | `4:3` | 默认宽高比（下拉选择：16:9 / 9:16 / 1:1 / 4:3 / 3:4） |

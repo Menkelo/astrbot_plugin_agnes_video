@@ -1,15 +1,9 @@
 {
-  "api_key": {
-    "description": "Agnes AI API Key",
-    "type": "string",
-    "hint": "在 Agnes AI 官网申请获取；如需突破每分钟 1 个视频任务的限流，可用英文逗号分隔填写多个 Key（如 key1,key2），插件会轮询使用",
-    "obvious_hint": true
-  },
   "api_keys": {
-    "description": "Agnes API Key 列表（可选）",
+    "description": "Agnes API Key 列表",
     "type": "list",
     "default": [],
-    "hint": "每项填写一个 Key；填了此项则优先使用它轮询，未填时使用上方 api_key"
+    "hint": "每项填写一个 Key，在 Agnes AI 官网申请获取；配置多个 Key 时插件会轮询使用，绕过每分钟 1 个视频任务的限流"
   },
   "base_url": {
     "description": "API 网关地址",
