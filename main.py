@@ -144,7 +144,26 @@ class AgnesVideo(Star):
             public_url = None
         if public_url and public_url.startswith(("http://", "https://")):
             return public_url, "file_service"
+        data_uri = await self._to_data_uri(img)
+        if data_uri:
+            return data_uri, "base64"
         return None, "none"
+
+    async def _to_data_uri(self, img: Image) -> str | None:
+        """将图片转换为 Data URI Base64，作为无法获得公开 URL 时的兜底。
+
+        适用于 aiocqhttp 协议端未下发图片链接、仅提供本地文件路径的场景。
+        Agnes 图生视频 / 关键帧的 image 参数接受可公开访问的 URL 或
+        Data URI Base64（Image API 明确支持，Video API 兼容该约定）。
+        """
+        try:
+            b64 = await img.convert_to_base64()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[AgnesVideo] convert_to_base64 失败: {e}")
+            return None
+        if not b64:
+            return None
+        return f"data:image/jpeg;base64,{b64}"
 
     async def _collect_images(
         self, event: AstrMessageEvent
@@ -324,8 +343,8 @@ class AgnesVideo(Star):
         images, saw_image, skipped = await self._collect_images(event)
         if saw_image and not images:
             yield event.plain_result(
-                "已检测到图片，但未能获取可公开访问的图片 URL。\n"
-                "已尝试解析组件 URL、向协议端请求 get_image、以及 AstrBot 文件服务，均未获得可用链接"
+                "已检测到图片，但未能解析出可供 Agnes 使用的图片（URL 或 base64）。\n"
+                "已尝试组件 URL、协议端 get_image、AstrBot 文件服务以及本地 base64 转换，均未成功"
                 "（详见 AstrBot 日志中的 AgnesVideo 提示）。\n"
                 "也可以在命令中直接粘贴可公开访问的图片 URL。"
             )
