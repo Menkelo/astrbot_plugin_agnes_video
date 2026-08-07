@@ -16,29 +16,21 @@
     "type": "string",
     "default": "agnes-video-v2.0"
   },
-  "width": {
-    "description": "视频宽度（像素），如 1152 为 16:9 横版",
-    "type": "int",
-    "default": 1152,
-    "hint": "不匹配标准档位时系统会自动映射到最接近的规格"
+  "aspect_ratio": {
+    "description": "默认视频宽高比",
+    "type": "string",
+    "options": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+    "labels": ["16:9 横版", "9:16 竖版", "1:1 方形", "4:3 传统横版", "3:4 竖版肖像"],
+    "default": "4:3",
+    "hint": "文生视频的默认比例；图生视频 / 关键帧会自动按参考图比例映射。提示词中也可指定比例覆盖，如 16:9"
   },
-  "height": {
-    "description": "视频高度（像素），如 768 为 16:9 横版",
-    "type": "int",
-    "default": 768,
-    "hint": "不匹配标准档位时系统会自动映射到最接近的规格"
-  },
-  "num_frames": {
-    "description": "视频帧数",
-    "type": "int",
-    "default": 121,
-    "hint": "必须 ≤ 441 且满足 8n+1；121 帧 + 24fps 约 5 秒"
-  },
-  "frame_rate": {
-    "description": "视频帧率（1-60）",
-    "type": "int",
-    "default": 24,
-    "hint": "推荐 24 或 30，用于更流畅的运动"
+  "duration_seconds": {
+    "description": "默认视频时长",
+    "type": "string",
+    "options": ["3", "5", "10", "18"],
+    "labels": ["约 3 秒", "约 5 秒", "约 10 秒", "约 18 秒"],
+    "default": "5",
+    "hint": "提示词中可指定秒数覆盖，如 10s；非标准秒数会自动映射到最近档位"
   },
   "seed": {
     "description": "随机种子（-1 表示随机）",

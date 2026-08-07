@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import io
+import os
 import re
 
 import aiohttp
@@ -12,8 +15,40 @@ try:
 except ImportError:
     GreedyStr = str
 
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
+
 _DEFAULT_I2V_PROMPT = "让画面自然运动起来，保持主体、风格和场景一致，电影质感"
 _DEFAULT_KF_PROMPT = "在关键帧之间生成平滑自然的过渡，保持视觉一致和自然的镜头运动"
+
+_AGNES_RATIOS: dict[str, tuple[int, int]] = {
+    "16:9": (1280, 720),
+    "9:16": (720, 1280),
+    "1:1": (1024, 1024),
+    "4:3": (1024, 768),
+    "3:4": (768, 1024),
+}
+_DURATION_FRAMES: dict[int, int] = {3: 81, 5: 121, 10: 241, 18: 441}
+_DURATION_TIERS = sorted(_DURATION_FRAMES)
+_FRAME_RATE = 24
+
+_RATIO_RE = re.compile(
+    r"(?<!\d)(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*3|3\s*[:：]\s*4)(?!\d)",
+    re.IGNORECASE,
+)
+_RATIO_ALIASES = [
+    (re.compile(r"横屏|宽屏", re.IGNORECASE), "16:9"),
+    (re.compile(r"竖屏|竖图", re.IGNORECASE), "9:16"),
+    (re.compile(r"方图|方形", re.IGNORECASE), "1:1"),
+]
+_DURATION_RE = re.compile(r"(?<!\d)(\d{1,3})\s*(?:s|秒)(?!\d)", re.IGNORECASE)
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
 class AgnesVideo(Star):
@@ -47,31 +82,128 @@ class AgnesVideo(Star):
     def _api_key_ok(self) -> bool:
         return bool(self.config.get("api_key"))
 
-    def _build_payload(self) -> tuple[dict | None, str | None]:
-        """根据插件配置构建公共视频生成参数。
+    def _build_payload(self, aspect_ratio: str, duration_seconds: int) -> dict:
+        """根据宽高比与时长构建视频生成公共参数。
+
+        Args:
+            aspect_ratio: 宽高比，如 16:9 / 9:16 / 1:1 / 4:3 / 3:4。
+            duration_seconds: 目标时长（秒），须为支持档位 3/5/10/18。
 
         Returns:
-            (payload, error)：成功时 error 为 None，失败时 payload 为 None。
+            公共参数 dict。
         """
-        try:
-            num_frames = int(self.config.get("num_frames", 121))
-            if num_frames > 441:
-                raise ValueError("num_frames 不能超过 441")
-            if (num_frames - 1) % 8 != 0:
-                raise ValueError("num_frames 必须遵循 8n+1 规则")
-        except (TypeError, ValueError) as e:
-            return None, str(e)
+        width, height = _AGNES_RATIOS.get(aspect_ratio, _AGNES_RATIOS["4:3"])
+        num_frames = _DURATION_FRAMES.get(duration_seconds, 121)
         params = {
             "model": str(self.config.get("model", "agnes-video-v2.0")),
-            "width": int(self.config.get("width", 1152)),
-            "height": int(self.config.get("height", 768)),
-            "num_frames": int(self.config.get("num_frames", 121)),
-            "frame_rate": int(self.config.get("frame_rate", 24)),
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": _FRAME_RATE,
         }
         seed = int(self.config.get("seed", -1))
         if seed >= 0:
             params["seed"] = seed
-        return params, None
+        return params
+
+    @staticmethod
+    def _normalize_ratio(value: str) -> str:
+        return re.sub(r"\s+", "", value).replace("：", ":").lower()
+
+    @classmethod
+    def _extract_prompt_meta(cls, prompt: str) -> tuple[str, str | None, int | None]:
+        """从提示词中提取并移除比例与时长指定。
+
+        Returns:
+            (clean_prompt, aspect_ratio, duration_seconds)：均从提示词中解析，
+            未指定时为 None。
+        """
+        text = str(prompt or "")
+        aspect = None
+        duration = None
+
+        m = _RATIO_RE.search(text)
+        if m:
+            aspect = cls._normalize_ratio(m.group(1))
+            text = text[: m.start()] + " " + text[m.end() :]
+
+        if not aspect:
+            for pattern, ar in _RATIO_ALIASES:
+                mm = pattern.search(text)
+                if mm:
+                    aspect = ar
+                    text = pattern.sub(" ", text, count=1)
+                    break
+
+        m = _DURATION_RE.search(text)
+        if m:
+            duration = int(m.group(1))
+            text = text[: m.start()] + " " + text[m.end() :]
+
+        text = re.sub(r"\s+", " ", text).strip()
+        return text, aspect, duration
+
+    @staticmethod
+    def _map_duration(seconds: int) -> int:
+        """将目标秒数映射到最接近的支持时长档位。"""
+        return min(_DURATION_TIERS, key=lambda t: abs(t - seconds))
+
+    @staticmethod
+    def _map_ratio(ratio: float) -> str | None:
+        """将图片宽高比映射到最接近的支持比例。"""
+        if not ratio or ratio <= 0:
+            return None
+        return min(
+            _AGNES_RATIOS,
+            key=lambda ar: abs((_AGNES_RATIOS[ar][0] / _AGNES_RATIOS[ar][1]) - ratio),
+        )
+
+    async def _detect_image_ratio(self, ref: str) -> float | None:
+        """获取图片引用（URL / Data URI / 本地路径）的宽高比。
+
+        返回宽高比 w/h；无法读取时返回 None。
+        """
+        if PILImage is None:
+            return None
+        data: bytes | None = None
+        if ref.startswith("data:"):
+            try:
+                data = base64.b64decode(ref.split(",", 1)[1])
+            except Exception:  # noqa: BLE001
+                return None
+        elif ref.startswith(("http://", "https://")):
+            try:
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.get(ref, timeout=timeout) as resp,
+                ):
+                    data = await resp.read()
+            except Exception:  # noqa: BLE001
+                return None
+        else:
+            path = ref.removeprefix("file://")
+            if not (path and os.path.isfile(path)):
+                return None
+            try:
+                data = await asyncio.to_thread(_read_file, path)
+            except Exception:  # noqa: BLE001
+                return None
+        if not data:
+            return None
+
+        def _ratio() -> float | None:
+            with io.BytesIO(data) as buf:
+                img = PILImage.open(buf)
+                w, h = img.size
+                if w <= 0 or h <= 0:
+                    return None
+                return w / h
+
+        try:
+            return await asyncio.to_thread(_ratio)
+        except Exception:  # noqa: BLE001
+            return None
 
     @staticmethod
     def _image_url(img: Image) -> str:
@@ -254,16 +386,16 @@ class AgnesVideo(Star):
             logger.error(f"[AgnesVideo] 主动发送消息失败: {e}")
 
     async def _deliver_video(self, umo: str, video_url: str):
-        """先发送文本链接，再尝试直接发送视频消息。"""
-        await self._safe_send(
-            umo, MessageChain().message(f"视频生成完成！\n下载链接：{video_url}")
-        )
+        """直接发送视频消息，失败时才回退为发送下载链接。"""
         try:
             await self.context.send_message(
                 umo, MessageChain(chain=[Video.fromURL(url=video_url)])
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[AgnesVideo] 视频消息发送失败（链接已发送）: {e}")
+            logger.warning(f"[AgnesVideo] 视频消息发送失败，改发下载链接: {e}")
+            await self._safe_send(
+                umo, MessageChain().message(f"视频生成完成！\n下载链接：{video_url}")
+            )
 
     async def _poll_and_deliver(self, video_id: str, umo: str):
         """后台轮询任务，完成后将视频推送给用户。"""
@@ -354,32 +486,42 @@ class AgnesVideo(Star):
         for u in text_urls:
             if u not in images:
                 images.append(u)
-        prompt = re.sub(r"https?://\S+", "", text).strip()
+        clean_text = re.sub(r"https?://\S+", "", text).strip()
+        prompt, prompt_aspect, prompt_duration = self._extract_prompt_meta(clean_text)
 
         if skipped:
             if images:
                 yield event.plain_result(
-                    f"提示：有 {skipped} 张图片未能解析出可公开访问的链接，已忽略，"
+                    f"提示：有 {skipped} 张图片未能解析出可供 Agnes 使用的图片，已忽略，"
                     "将使用其余图片/URL 继续。"
                 )
             else:
                 yield event.plain_result(
-                    f"有 {skipped} 张图片未能解析出可公开访问的链接，且没有其他可用图片或 URL。\n"
+                    f"有 {skipped} 张图片未能解析出可供 Agnes 使用的图片，且没有其他可用图片或 URL。\n"
                     "如需使用这些图片，请直接粘贴其公开 URL。"
                 )
                 return
 
-        payload, err = self._build_payload()
-        if err:
-            yield event.plain_result(f"参数错误：{err}")
-            return
+        aspect = prompt_aspect
+        if not aspect and images:
+            ratio = await self._detect_image_ratio(images[0])
+            aspect = self._map_ratio(ratio) if ratio else None
+        if not aspect:
+            aspect = str(self.config.get("aspect_ratio", "4:3"))
+        if aspect not in _AGNES_RATIOS:
+            aspect = "4:3"
+
+        duration = prompt_duration or int(self.config.get("duration_seconds", 5))
+        duration = self._map_duration(duration)
+        payload = self._build_payload(aspect, duration)
 
         if not images:
             if not prompt:
                 yield event.plain_result(
                     "用法：/vgen <提示词>\n"
                     "发消息时附带图片可进行图生视频；"
-                    "引用含两张及以上图片的消息可进行关键帧动画。"
+                    "引用含两张及以上图片的消息可进行关键帧动画。\n"
+                    "提示词中可指定宽高比（如 16:9）与时长（如 10s）。"
                 )
                 return
             payload["prompt"] = prompt
