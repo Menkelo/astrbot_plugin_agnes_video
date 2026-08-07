@@ -1,7 +1,5 @@
 import asyncio
-import ipaddress
 import re
-from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
@@ -76,25 +74,6 @@ class AgnesVideo(Star):
         return params, None
 
     @staticmethod
-    def _looks_public_url(url: str) -> bool:
-        """粗略判断 URL 是否可能是公网可访问的（非内网/本机地址）。"""
-        try:
-            host = (urlparse(url).hostname or "").strip().lower()
-        except Exception:  # noqa: BLE001
-            return False
-        if not host:
-            return False
-        if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.endswith(
-            ".local"
-        ):
-            return False
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            ip = None
-        return not (ip is not None and ip.is_private)
-
-    @staticmethod
     def _image_url(img: Image) -> str:
         """从 Image 组件中提取可公开访问的 URL。"""
         url = (img.url or "").strip()
@@ -105,24 +84,67 @@ class AgnesVideo(Star):
             return file_
         return ""
 
-    async def _resolve_image_url(self, img: Image) -> tuple[str | None, bool]:
+    async def _resolve_via_onebot(
+        self, event: AstrMessageEvent, img: Image
+    ) -> str | None:
+        """通过 OneBot 协议端 get_image API 解析图片 URL。
+
+        当消息平台未直接下发图片链接时，可凭 file/file_id/image 等标识向协议端
+        请求图片的下载地址。适用于 aiocqhttp（NapCat / Lagrange 等）平台。
+        """
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            return None
+        refs = []
+        for field in (img.file, img.url, img.path):
+            if isinstance(field, str) and field.strip():
+                refs.append(field.strip())
+        if not refs:
+            return None
+        for ref in refs:
+            for params in (
+                {"file": ref},
+                {"file_id": ref},
+                {"image": ref},
+                {"id": ref},
+            ):
+                try:
+                    ret = await call_action("get_image", **params)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[AgnesVideo] get_image({params}) 失败: {e}")
+                    continue
+                data = (ret or {}).get("data") or {}
+                url = data.get("url") or data.get("file")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+        return None
+
+    async def _resolve_image_url(
+        self, event: AstrMessageEvent, img: Image
+    ) -> tuple[str | None, str]:
         """解析单张图片为可供 Agnes 使用的 URL。
 
+        解析顺序：组件自带 URL → 协议端 get_image → AstrBot 文件服务。
+
         Returns:
-            (url, public_likely)：url 为可用链接（None 表示失败）；
-            public_likely 表示该链接是否可能被公网服务访问。
+            (url, source)：url 为可用链接（None 表示失败），source 说明解析来源。
         """
         url = self._image_url(img)
         if url:
-            return url, self._looks_public_url(url)
+            return url, "component"
+        url = await self._resolve_via_onebot(event, img)
+        if url:
+            return url, "onebot_api"
         try:
             public_url = await img.register_to_file_service()
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[AgnesVideo] register_to_file_service 失败: {e}")
-            return None, False
+            public_url = None
         if public_url and public_url.startswith(("http://", "https://")):
-            return public_url, self._looks_public_url(public_url)
-        return None, False
+            return public_url, "file_service"
+        return None, "none"
 
     async def _collect_images(
         self, event: AstrMessageEvent
@@ -156,12 +178,18 @@ class AgnesVideo(Star):
                         candidates.append(sub)
 
         for img in candidates:
-            url, _ = await self._resolve_image_url(img)
+            url, _ = await self._resolve_image_url(event, img)
             if url and url not in seen:
                 seen.add(url)
                 urls.append(url)
             elif not url:
                 skipped += 1
+                logger.warning(
+                    f"[AgnesVideo] 图片解析失败，组件字段: "
+                    f"url={img.url!r} file={img.file!r} path={img.path!r}"
+                )
+            elif url in seen:
+                logger.debug(f"[AgnesVideo] 图片 URL 重复，已忽略: {url}")
         return urls, saw_image, skipped
 
     async def _create_task(self, payload: dict) -> dict:
@@ -297,8 +325,8 @@ class AgnesVideo(Star):
         if saw_image and not images:
             yield event.plain_result(
                 "已检测到图片，但未能获取可公开访问的图片 URL。\n"
-                "当前消息平台未下发图片链接，且未能通过 AstrBot 文件服务解析"
-                "（请确认已在 AstrBot 配置中设置公网可达的 callback_api_base）。\n"
+                "已尝试解析组件 URL、向协议端请求 get_image、以及 AstrBot 文件服务，均未获得可用链接"
+                "（详见 AstrBot 日志中的 AgnesVideo 提示）。\n"
                 "也可以在命令中直接粘贴可公开访问的图片 URL。"
             )
             return
