@@ -1,5 +1,7 @@
 import asyncio
+import ipaddress
 import re
+from urllib.parse import urlparse
 
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
@@ -74,6 +76,25 @@ class AgnesVideo(Star):
         return params, None
 
     @staticmethod
+    def _looks_public_url(url: str) -> bool:
+        """粗略判断 URL 是否可能是公网可访问的（非内网/本机地址）。"""
+        try:
+            host = (urlparse(url).hostname or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            return False
+        if not host:
+            return False
+        if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.endswith(
+            ".local"
+        ):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        return not (ip is not None and ip.is_private)
+
+    @staticmethod
     def _image_url(img: Image) -> str:
         """从 Image 组件中提取可公开访问的 URL。"""
         url = (img.url or "").strip()
@@ -84,7 +105,28 @@ class AgnesVideo(Star):
             return file_
         return ""
 
-    def _collect_images(self, event: AstrMessageEvent) -> tuple[list[str], bool]:
+    async def _resolve_image_url(self, img: Image) -> tuple[str | None, bool]:
+        """解析单张图片为可供 Agnes 使用的 URL。
+
+        Returns:
+            (url, public_likely)：url 为可用链接（None 表示失败）；
+            public_likely 表示该链接是否可能被公网服务访问。
+        """
+        url = self._image_url(img)
+        if url:
+            return url, self._looks_public_url(url)
+        try:
+            public_url = await img.register_to_file_service()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[AgnesVideo] register_to_file_service 失败: {e}")
+            return None, False
+        if public_url and public_url.startswith(("http://", "https://")):
+            return public_url, self._looks_public_url(public_url)
+        return None, False
+
+    async def _collect_images(
+        self, event: AstrMessageEvent
+    ) -> tuple[list[str], bool, int]:
         """收集事件中的图片 URL。
 
         覆盖两种调用方式：
@@ -92,30 +134,35 @@ class AgnesVideo(Star):
         - 引用/回复一条含图片的消息（Reply 组件的 chain 中嵌套的 Image 组件）。
 
         Returns:
-            (urls, saw_image)：urls 为可用的图片 URL 列表；
-            saw_image 表示消息中是否出现了图片组件（但可能缺少可用 URL）。
+            (urls, saw_image, skipped)：urls 为可用的图片 URL 列表；
+            saw_image 表示消息中是否出现了图片组件；
+            skipped 表示检测到但未能解析出 URL 的图片数量。
         """
         urls: list[str] = []
         seen: set[str] = set()
         saw_image = False
+        skipped = 0
 
         message = getattr(event.message_obj, "message", None) or []
+        candidates: list[Image] = []
         for comp in message:
             if isinstance(comp, Image):
                 saw_image = True
-                url = self._image_url(comp)
-                if url and url not in seen:
-                    seen.add(url)
-                    urls.append(url)
+                candidates.append(comp)
             elif isinstance(comp, Reply):
                 for sub in comp.chain or []:
                     if isinstance(sub, Image):
                         saw_image = True
-                        url = self._image_url(sub)
-                        if url and url not in seen:
-                            seen.add(url)
-                            urls.append(url)
-        return urls, saw_image
+                        candidates.append(sub)
+
+        for img in candidates:
+            url, _ = await self._resolve_image_url(img)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+            elif not url:
+                skipped += 1
+        return urls, saw_image, skipped
 
     async def _create_task(self, payload: dict) -> dict:
         """创建视频生成任务。"""
@@ -246,11 +293,13 @@ class AgnesVideo(Star):
         """AI 视频生成。发消息时附带图片或引用含图片的消息，自动切换生成模式。"""
         text = text.strip()
 
-        images, saw_image = self._collect_images(event)
+        images, saw_image, skipped = await self._collect_images(event)
         if saw_image and not images:
             yield event.plain_result(
-                "已检测到图片，但未能获取其 URL（当前消息平台未下发图片链接）。"
-                "请直接粘贴可公开访问的图片 URL。"
+                "已检测到图片，但未能获取可公开访问的图片 URL。\n"
+                "当前消息平台未下发图片链接，且未能通过 AstrBot 文件服务解析"
+                "（请确认已在 AstrBot 配置中设置公网可达的 callback_api_base）。\n"
+                "也可以在命令中直接粘贴可公开访问的图片 URL。"
             )
             return
 
@@ -259,6 +308,19 @@ class AgnesVideo(Star):
             if u not in images:
                 images.append(u)
         prompt = re.sub(r"https?://\S+", "", text).strip()
+
+        if skipped:
+            if images:
+                yield event.plain_result(
+                    f"提示：有 {skipped} 张图片未能解析出可公开访问的链接，已忽略，"
+                    "将使用其余图片/URL 继续。"
+                )
+            else:
+                yield event.plain_result(
+                    f"有 {skipped} 张图片未能解析出可公开访问的链接，且没有其他可用图片或 URL。\n"
+                    "如需使用这些图片，请直接粘贴其公开 URL。"
+                )
+                return
 
         payload, err = self._build_payload()
         if err:
