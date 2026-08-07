@@ -23,12 +23,6 @@ repo: https://github.com/Menkelo/astrbot_plugin_agnes_video
 astrbot_version: ">=4.0"
 support_platforms:
   - aiocqhttp
-  - qq_official
-  - telegram
-  - discord
-  - lark
-  - dingtalk
-  - slack
 tags:
   - video
   - ai
