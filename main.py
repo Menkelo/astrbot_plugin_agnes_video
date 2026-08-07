@@ -450,7 +450,14 @@ class AgnesVideo(Star):
             data = await self._create_task(payload)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[AgnesVideo] 创建任务失败: {e}")
-            yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
+            if "HTTP 429" in str(e):
+                yield event.plain_result(
+                    f"{mode_desc}任务创建失败：触发了 Agnes 接口限流。\n"
+                    "Agnes 限制每个 API Key 每分钟最多创建 1 个视频任务，"
+                    "请等待约 1 分钟后再试。"
+                )
+            else:
+                yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
             return
         video_id = data.get("video_id") or data.get("task_id") or data.get("id")
         if not video_id:
