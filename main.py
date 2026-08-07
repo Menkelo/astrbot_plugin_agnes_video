@@ -64,12 +64,39 @@ class AgnesVideo(Star):
         super().__init__(context)
         self.config = config
         self._tasks: dict[str, asyncio.Task] = {}
+        self._keys: list[str] = self._resolve_keys()
+        self._key_index = 0
+
+    def _resolve_keys(self) -> list[str]:
+        """解析 API Key 列表。
+
+        优先读取 `api_keys`（list，每项一个 Key）；否则读取 `api_key`
+        （支持用英文逗号分隔多个 Key，用于轮询绕过每分钟 1 个视频任务的限流）。
+        """
+        keys: list[str] = []
+        for k in self.config.get("api_keys") or []:
+            if isinstance(k, str) and k.strip():
+                keys.append(k.strip())
+        if not keys:
+            raw = self.config.get("api_key", "")
+            if isinstance(raw, str):
+                keys = [k.strip() for k in raw.split(",") if k.strip()]
+        return keys or []
+
+    def _next_key(self) -> str:
+        """按顺序轮询返回下一个 API Key。"""
+        if not self._keys:
+            return ""
+        key = self._keys[self._key_index % len(self._keys)]
+        self._key_index += 1
+        return key
 
     # ============================== 内部工具 ==============================
 
-    def _headers(self) -> dict:
+    def _headers(self, api_key: str = "") -> dict:
+        key = api_key or (self._keys[0] if self._keys else "")
         return {
-            "Authorization": f"Bearer {self.config.get('api_key', '')}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
 
@@ -80,7 +107,7 @@ class AgnesVideo(Star):
         )
 
     def _api_key_ok(self) -> bool:
-        return bool(self.config.get("api_key"))
+        return bool(self._keys and self._keys[0])
 
     def _build_payload(self, aspect_ratio: str, duration_seconds: int) -> dict:
         """根据宽高比与时长构建视频生成公共参数。
@@ -344,19 +371,41 @@ class AgnesVideo(Star):
         return urls, saw_image, skipped
 
     async def _create_task(self, payload: dict) -> dict:
-        """创建视频生成任务。"""
+        """创建视频生成任务（使用轮询选出的 API Key）。"""
         url = f"{self._base_url}/v1/videos"
         timeout = aiohttp.ClientTimeout(total=60)
+        api_key = self._next_key()
         async with (
             aiohttp.ClientSession() as session,
             session.post(
-                url, headers=self._headers(), json=payload, timeout=timeout
+                url, headers=self._headers(api_key), json=payload, timeout=timeout
             ) as resp,
         ):
             data = await resp.json(content_type=None)
             if resp.status >= 400:
                 raise RuntimeError(f"HTTP {resp.status}: {data}")
             return data
+
+    async def _create_task_retry(self, payload: dict) -> dict:
+        """创建视频任务；遇到 429 限流时自动切换到下一个 Key 重试。
+
+        单个 Key 时只尝试一次；多个 Key 时逐个轮换尝试。
+        """
+        attempts = max(len(self._keys), 1)
+        last_err: Exception | None = None
+        for i in range(attempts):
+            try:
+                return await self._create_task(payload)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(
+                    f"[AgnesVideo] 创建任务第 {i + 1} 次尝试失败（Key #{i % max(len(self._keys), 1)}）: {e}"
+                )
+                if "HTTP 429" not in str(e):
+                    break
+        if last_err is None:
+            raise RuntimeError("创建视频任务失败")
+        raise last_err
 
     async def _query_task(self, video_id: str) -> dict:
         """查询视频生成任务状态（推荐方式，使用 video_id）。"""
@@ -386,16 +435,26 @@ class AgnesVideo(Star):
             logger.error(f"[AgnesVideo] 主动发送消息失败: {e}")
 
     async def _deliver_video(self, umo: str, video_url: str):
-        """直接发送视频消息，失败时才回退为发送下载链接。"""
-        try:
-            await self.context.send_message(
-                umo, MessageChain(chain=[Video.fromURL(url=video_url)])
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[AgnesVideo] 视频消息发送失败，改发下载链接: {e}")
-            await self._safe_send(
-                umo, MessageChain().message(f"视频生成完成！\n下载链接：{video_url}")
-            )
+        """直接发送视频消息；失败重试一次，仍失败则只给简短提示。"""
+        for attempt in range(2):
+            try:
+                await self.context.send_message(
+                    umo, MessageChain(chain=[Video.fromURL(url=video_url)])
+                )
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[AgnesVideo] 视频消息发送失败（第 {attempt + 1} 次）: {e}"
+                )
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        logger.info(f"[AgnesVideo] 视频发送失败，下载链接（仅供排查）: {video_url}")
+        await self._safe_send(
+            umo,
+            MessageChain().message(
+                "视频生成完成，但当前消息平台发送视频失败，请稍后重试。"
+            ),
+        )
 
     async def _poll_and_deliver(self, video_id: str, umo: str):
         """后台轮询任务，完成后将视频推送给用户。"""
@@ -434,27 +493,27 @@ class AgnesVideo(Star):
         await self._safe_send(
             umo,
             MessageChain().message(
-                f"任务等待超时（>{max_poll_time}s），视频仍在生成中。\n"
-                f"任务 ID：{video_id}，可调大插件配置中的 max_poll_time 以延长等待。"
+                f"视频生成时间超过预期（>{max_poll_time}s），仍在后台生成中，"
+                "完成后将自动发送视频，请稍候。"
             ),
         )
 
     async def _submit(self, event: AstrMessageEvent, payload: dict, mode_desc: str):
-        """创建任务、返回任务 ID，并启动后台轮询。"""
+        """创建任务并启动后台轮询。"""
         if not self._api_key_ok():
             yield event.plain_result(
                 "未配置 Agnes AI API Key，请在插件配置中填写 api_key。"
             )
             return
         try:
-            data = await self._create_task(payload)
+            data = await self._create_task_retry(payload)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[AgnesVideo] 创建任务失败: {e}")
             if "HTTP 429" in str(e):
                 yield event.plain_result(
                     f"{mode_desc}任务创建失败：触发了 Agnes 接口限流。\n"
                     "Agnes 限制每个 API Key 每分钟最多创建 1 个视频任务，"
-                    "请等待约 1 分钟后再试。"
+                    "若配置了多个 Key 已自动轮换，请等待约 1 分钟后再试。"
                 )
             else:
                 yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
@@ -468,8 +527,7 @@ class AgnesVideo(Star):
             self._poll_and_deliver(video_id, umo)
         )
         yield event.plain_result(
-            f"{mode_desc}任务已创建！任务 ID：{video_id}\n"
-            "正在生成中，完成后将自动发送视频，请稍候……"
+            f"{mode_desc}任务已创建，正在生成中，完成后将自动发送视频，请稍候……"
         )
 
     # ============================== 命令 ==============================
