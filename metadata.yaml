@@ -1,0 +1,35 @@
+name: astrbot_plugin_agnes_video
+display_name: Agnes Video
+short_desc: 基于 Agnes AI Video V2.0 的 AI 视频生成插件，支持文生视频、图生视频与关键帧动画。
+desc: |
+  基于 Agnes AI Video V2.0 API 的异步视频生成插件。
+
+  功能特性：
+  - 文生视频：通过文本提示词直接生成电影级视频。
+  - 图生视频：消息中附带或引用一张图片，将静态图片转化为动态视频。
+  - 关键帧动画：引用两张及以上图片，在多个关键帧之间生成流畅过渡。
+  - 自动分流：单个 /vgen 命令根据消息中的图片数量自动选择生成模式。
+  - 异步任务管理：创建任务后后台自动轮询，生成完成自动推送视频，无需用户等待。
+
+  使用方式（在机器人会话中发送）：
+  - /vgen <提示词>  文生视频
+  - /vgen <提示词>（消息附带一张图片）  图生视频
+  - /vgen <提示词>（引用含两张及以上图片的消息）  关键帧动画
+
+  需要先在插件配置中填写 Agnes AI 的 API Key。
+version: 1.0.0
+author: Menkelo
+repo: https://github.com/Menkelo/astrbot_plugin_agnes_video
+astrbot_version: ">=4.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - lark
+  - dingtalk
+  - slack
+tags:
+  - video
+  - ai
+  - 视频生成

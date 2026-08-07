@@ -1,0 +1,60 @@
+{
+  "api_key": {
+    "description": "Agnes AI API Key",
+    "type": "string",
+    "hint": "在 Agnes AI 官网申请获取",
+    "obvious_hint": true
+  },
+  "base_url": {
+    "description": "API 网关地址",
+    "type": "string",
+    "hint": "一般无需修改",
+    "default": "https://apihub.agnes-ai.com"
+  },
+  "model": {
+    "description": "视频生成模型名称",
+    "type": "string",
+    "default": "agnes-video-v2.0"
+  },
+  "width": {
+    "description": "视频宽度（像素），如 1152 为 16:9 横版",
+    "type": "int",
+    "default": 1152,
+    "hint": "不匹配标准档位时系统会自动映射到最接近的规格"
+  },
+  "height": {
+    "description": "视频高度（像素），如 768 为 16:9 横版",
+    "type": "int",
+    "default": 768,
+    "hint": "不匹配标准档位时系统会自动映射到最接近的规格"
+  },
+  "num_frames": {
+    "description": "视频帧数",
+    "type": "int",
+    "default": 121,
+    "hint": "必须 ≤ 441 且满足 8n+1；121 帧 + 24fps 约 5 秒"
+  },
+  "frame_rate": {
+    "description": "视频帧率（1-60）",
+    "type": "int",
+    "default": 24,
+    "hint": "推荐 24 或 30，用于更流畅的运动"
+  },
+  "seed": {
+    "description": "随机种子（-1 表示随机）",
+    "type": "int",
+    "default": -1,
+    "hint": "设置固定种子可生成可复现的结果"
+  },
+  "poll_interval": {
+    "description": "任务轮询间隔（秒）",
+    "type": "int",
+    "default": 5
+  },
+  "max_poll_time": {
+    "description": "后台等待任务完成的最大时间（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "超时后仅返回任务 ID，可通过 /vgen status 继续查询"
+  }
+}
