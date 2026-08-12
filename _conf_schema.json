@@ -1,26 +1,54 @@
 {
+  "provider": {
+    "description": "视频生成服务提供商",
+    "type": "string",
+    "options": ["agnes", "tokendance"],
+    "labels": ["Agnes AI Video", "TokenDance (MiniMax H3)"],
+    "default": "agnes",
+    "hint": "agnes 使用 Agnes AI Video V2.0 API；tokendance 使用 TokenDance 网关调用 MiniMax H3"
+  },
   "api_keys": {
-    "description": "Agnes API Key 列表",
+    "description": "API Key 列表",
     "type": "list",
     "default": [],
-    "hint": "每项填写一个 Key，在 Agnes AI 官网申请获取；配置多个 Key 时插件会轮询使用，绕过每分钟 1 个视频任务的限流"
+    "hint": "每项填写一个 Key；agnes 提供商填写 Agnes AI 官网申请的 Key，tokendance 提供商填写 TokenDance 控制台生成的 API Key。配置多个 Key 时插件会轮询使用"
   },
   "base_url": {
-    "description": "API 网关地址",
+    "description": "Agnes API 网关地址",
     "type": "string",
-    "hint": "一般无需修改",
+    "hint": "仅 agnes 提供商使用，一般无需修改",
     "default": "https://apihub.agnes-ai.com"
   },
+  "tokendance_base_url": {
+    "description": "TokenDance API 网关地址",
+    "type": "string",
+    "hint": "仅 tokendance 提供商使用，一般无需修改",
+    "default": "https://tokendance.space/gateway/minimax"
+  },
   "model": {
-    "description": "视频生成模型名称",
+    "description": "Agnes 视频生成模型名称",
     "type": "string",
     "default": "agnes-video-v2.0"
+  },
+  "tokendance_model": {
+    "description": "TokenDance 视频生成模型名称",
+    "type": "string",
+    "hint": "仅 tokendance 提供商使用",
+    "default": "minimax-h3"
+  },
+  "resolution": {
+    "description": "TokenDance 视频分辨率",
+    "type": "string",
+    "options": ["768P", "2K"],
+    "labels": ["768P", "2K"],
+    "default": "768P",
+    "hint": "仅 tokendance 提供商使用；MiniMax H3 支持 768P / 2K，2K 更清晰但生成更慢"
   },
   "aspect_ratio": {
     "description": "默认视频宽高比",
     "type": "string",
-    "options": ["16:9", "9:16", "1:1", "4:3", "3:4"],
-    "labels": ["16:9 横版", "9:16 竖版", "1:1 方形", "4:3 传统横版", "3:4 竖版肖像"],
+    "options": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"],
+    "labels": ["16:9 横版", "9:16 竖版", "1:1 方形", "4:3 传统横版", "3:4 竖版肖像", "21:9 超宽屏"],
     "default": "4:3",
     "hint": "文生视频的默认比例；图生视频 / 关键帧会自动按参考图比例映射。提示词中也可指定比例覆盖，如 16:9"
   },
@@ -30,13 +58,13 @@
     "options": ["3", "5", "10", "18"],
     "labels": ["约 3 秒", "约 5 秒", "约 10 秒", "约 18 秒"],
     "default": "5",
-    "hint": "提示词中可指定秒数覆盖，如 10s；非标准秒数会自动映射到最近档位"
+    "hint": "提示词中可指定秒数覆盖，如 10s；agnes 档位为 3/5/10/18 秒，tokendance(MiniMax H3) 支持 4-15 秒整数并会自动钳制到该范围"
   },
   "seed": {
     "description": "随机种子（-1 表示随机）",
     "type": "int",
     "default": -1,
-    "hint": "设置固定种子可生成可复现的结果"
+    "hint": "设置固定种子可生成可复现的结果；仅 agnes 提供商支持"
   },
   "poll_interval": {
     "description": "任务轮询间隔（秒）",

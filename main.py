@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 import io
 import os
@@ -29,13 +30,17 @@ _AGNES_RATIOS: dict[str, tuple[int, int]] = {
     "1:1": (1024, 1024),
     "4:3": (1024, 768),
     "3:4": (768, 1024),
+    "21:9": (1260, 540),
 }
+_H3_RATIOS: set[str] = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 _DURATION_FRAMES: dict[int, int] = {3: 81, 5: 121, 10: 241, 18: 441}
 _DURATION_TIERS = sorted(_DURATION_FRAMES)
+_H3_MIN_DURATION = 4
+_H3_MAX_DURATION = 15
 _FRAME_RATE = 24
 
 _RATIO_RE = re.compile(
-    r"(?<!\d)(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*3|3\s*[:：]\s*4)(?!\d)",
+    r"(?<!\d)(21\s*[:：]\s*9|16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*3|3\s*[:：]\s*4)(?!\d)",
     re.IGNORECASE,
 )
 _RATIO_ALIASES = [
@@ -52,7 +57,7 @@ def _read_file(path: str) -> bytes:
 
 
 class AgnesVideo(Star):
-    """Agnes AI Video V2.0 视频生成插件。
+    """AI 视频生成插件，支持 Agnes AI Video 与 TokenDance(MiniMax H3) 双提供商。
 
     根据消息中附带或引用的图片自动选择生成模式：
     - 无图片：文生视频
@@ -63,6 +68,7 @@ class AgnesVideo(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._provider = str(config.get("provider", "agnes") or "agnes").strip().lower()
         self._tasks: dict[str, asyncio.Task] = {}
         self._keys: list[str] = self._resolve_keys()
         self._key_index = 0
@@ -97,23 +103,43 @@ class AgnesVideo(Star):
 
     @property
     def _base_url(self) -> str:
-        return str(self.config.get("base_url", "https://apihub.agnes-ai.com")).rstrip(
-            "/"
+        default = (
+            "https://tokendance.space/gateway/minimax"
+            if self._provider == "tokendance"
+            else "https://apihub.agnes-ai.com"
         )
+        return str(self.config.get("base_url", default)).rstrip("/")
 
     def _api_key_ok(self) -> bool:
         return bool(self._keys and self._keys[0])
 
-    def _build_payload(self, aspect_ratio: str, duration_seconds: int) -> dict:
+    def _build_payload(
+        self, aspect_ratio: str, duration_seconds: int
+    ) -> dict:
         """根据宽高比与时长构建视频生成公共参数。
 
+        不同提供商参数结构不同：
+        - agnes：width/height/num_frames/frame_rate 的显式像素与帧数配置。
+        - tokendance(MiniMax H3)：resolution/duration/ratio，宽高比由模型按档位处理。
+
         Args:
-            aspect_ratio: 宽高比，如 16:9 / 9:16 / 1:1 / 4:3 / 3:4。
-            duration_seconds: 目标时长（秒），须为支持档位 3/5/10/18。
+            aspect_ratio: 宽高比，如 16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 21:9。
+            duration_seconds: 目标时长（秒）。
 
         Returns:
             公共参数 dict。
         """
+        if self._provider == "tokendance":
+            params = {
+                "model": str(self.config.get("tokendance_model", "minimax-h3")),
+                "resolution": str(self.config.get("resolution", "768P")),
+                "duration": max(
+                    _H3_MIN_DURATION,
+                    min(_H3_MAX_DURATION, duration_seconds),
+                ),
+                "ratio": aspect_ratio if aspect_ratio in _H3_RATIOS else "16:9",
+            }
+            return params
         width, height = _AGNES_RATIOS.get(aspect_ratio, _AGNES_RATIOS["4:3"])
         num_frames = _DURATION_FRAMES.get(duration_seconds, 121)
         params = {
@@ -367,7 +393,10 @@ class AgnesVideo(Star):
 
     async def _create_task(self, payload: dict) -> dict:
         """创建视频生成任务（使用轮询选出的 API Key）。"""
-        url = f"{self._base_url}/v1/videos"
+        if self._provider == "tokendance":
+            url = f"{self._base_url}/v2/video_generation"
+        else:
+            url = f"{self._base_url}/v1/videos"
         timeout = aiohttp.ClientTimeout(total=60)
         api_key = self._next_key()
         async with (
@@ -403,10 +432,26 @@ class AgnesVideo(Star):
         raise last_err
 
     async def _query_task(self, video_id: str) -> dict:
-        """查询视频生成任务状态（推荐方式，使用 video_id）。"""
+        """查询视频生成任务状态。
+
+        - agnes：GET {base}/agnesapi?video_id=...（推荐方式）。
+        - tokendance(MiniMax H3)：GET {base}/v2/query/video_generation/{task_id}。
+        """
+        timeout = aiohttp.ClientTimeout(total=60)
+        if self._provider == "tokendance":
+            url = f"{self._base_url}/v2/query/video_generation/{video_id}"
+            async with (
+                aiohttp.ClientSession() as session,
+                session.get(
+                    url, headers=self._headers(), timeout=timeout
+                ) as resp,
+            ):
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}: {data}")
+                return data
         url = f"{self._base_url}/agnesapi"
         params = {"video_id": video_id}
-        timeout = aiohttp.ClientTimeout(total=60)
         async with (
             aiohttp.ClientSession() as session,
             session.get(
@@ -418,14 +463,24 @@ class AgnesVideo(Star):
                 raise RuntimeError(f"HTTP {resp.status}: {data}")
             return data
 
-    @staticmethod
-    def _extract_video_url(data: dict) -> str:
+    def _extract_video_url(self, data: dict) -> str:
         """从任务响应中提取最终视频 URL。"""
+        if self._provider == "tokendance":
+            return ((data.get("task") or {}).get("content") or {}).get("url") or ""
         return ((data.get("metadata") or {}).get("url")) or data.get("url") or ""
 
     @staticmethod
     def _extract_error_message(err: str) -> str:
         """从错误字符串中提取简短的错误信息。"""
+        try:
+            parsed = ast.literal_eval(err)
+            if isinstance(parsed, dict):
+                nested = parsed.get("error") if isinstance(parsed.get("error"), dict) else None
+                msg = (nested or parsed).get("message")
+                if isinstance(msg, str):
+                    return msg.strip()[:200]
+        except Exception:  # noqa: BLE001
+            pass
         m = re.search(r"'message':\s*'([^']*)'", err)
         if m:
             return m.group(1).strip()[:200]
@@ -486,24 +541,47 @@ class AgnesVideo(Star):
                 elapsed += poll_interval
                 continue
             status = data.get("status")
-            if status == "completed":
-                video_url = self._extract_video_url(data)
-                if video_url:
-                    await self._deliver_video(umo, video_url)
-                else:
+            if self._provider == "tokendance":
+                status = (data.get("task") or {}).get("status")
+                if status == "succeeded":
+                    video_url = self._extract_video_url(data)
+                    if video_url:
+                        await self._deliver_video(umo, video_url)
+                    else:
+                        await self._safe_send(
+                            umo,
+                            MessageChain().message(
+                                "视频生成完成，但响应中未找到视频链接。"
+                            ),
+                        )
+                    return
+                if status in ("failed", "cancelled", "expired"):
+                    task = data.get("task") or {}
+                    err = (task.get("error") or {}).get("message") or "任务已终止"
                     await self._safe_send(
                         umo,
-                        MessageChain().message(
-                            "视频生成完成，但响应中未找到视频链接。"
-                        ),
+                        MessageChain().message(f"视频生成失败：{err}"),
                     )
-                return
-            if status == "failed":
-                await self._safe_send(
-                    umo,
-                    MessageChain().message(f"视频生成失败：{data.get('error')}"),
-                )
-                return
+                    return
+            else:
+                if status == "completed":
+                    video_url = self._extract_video_url(data)
+                    if video_url:
+                        await self._deliver_video(umo, video_url)
+                    else:
+                        await self._safe_send(
+                            umo,
+                            MessageChain().message(
+                                "视频生成完成，但响应中未找到视频链接。"
+                            ),
+                        )
+                    return
+                if status == "failed":
+                    await self._safe_send(
+                        umo,
+                        MessageChain().message(f"视频生成失败：{data.get('error')}"),
+                    )
+                    return
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
         await self._safe_send(
@@ -517,8 +595,9 @@ class AgnesVideo(Star):
     async def _submit(self, event: AstrMessageEvent, payload: dict, mode_desc: str):
         """创建任务并启动后台轮询。"""
         if not self._api_key_ok():
+            provider_name = "TokenDance" if self._provider == "tokendance" else "Agnes"
             yield event.plain_result(
-                "未配置 Agnes API Key，请在插件配置中填写 api_keys 列表。"
+                f"未配置 {provider_name} API Key，请在插件配置中填写 api_keys 列表。"
             )
             return
         try:
@@ -526,11 +605,17 @@ class AgnesVideo(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"[AgnesVideo] 创建任务失败: {e}")
             if "HTTP 429" in str(e):
-                yield event.plain_result(
-                    f"{mode_desc}任务创建失败：触发了 Agnes 接口限流。\n"
-                    "Agnes 限制每个 API Key 每分钟最多创建 1 个视频任务，"
-                    "若配置了多个 Key 已自动轮换，请等待约 1 分钟后再试。"
-                )
+                if self._provider == "tokendance":
+                    hint = (
+                        "触发了 TokenDance 网关或上游供应商限流（HTTP 429），"
+                        "若配置了多个 Key 已自动轮换，请稍后重试。"
+                    )
+                else:
+                    hint = (
+                        "Agnes 限制每个 API Key 每分钟最多创建 1 个视频任务，"
+                        "若配置了多个 Key 已自动轮换，请等待约 1 分钟后再试。"
+                    )
+                yield event.plain_result(f"{mode_desc}任务创建失败：{hint}")
             else:
                 yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
             return
@@ -556,7 +641,7 @@ class AgnesVideo(Star):
         images, saw_image, skipped = await self._collect_images(event)
         if saw_image and not images:
             yield event.plain_result(
-                "已检测到图片，但未能解析出可供 Agnes 使用的图片（URL 或 base64）。\n"
+                "已检测到图片，但未能解析出可供视频生成使用的图片（URL 或 base64）。\n"
                 "已尝试组件 URL、协议端 get_image、AstrBot 文件服务以及本地 base64 转换，均未成功"
                 "（详见 AstrBot 日志中的 AgnesVideo 提示）。\n"
                 "也可以在命令中直接粘贴可公开访问的图片 URL。"
@@ -570,15 +655,22 @@ class AgnesVideo(Star):
         clean_text = re.sub(r"https?://\S+", "", text).strip()
         prompt, prompt_aspect, prompt_duration = self._extract_prompt_meta(clean_text)
 
+        if self._provider == "tokendance" and len(images) > 9:
+            yield event.plain_result(
+                f"提示：MiniMax H3 单次最多使用 9 张参考图片，已截断至前 9 张，"
+                "将使用其余参数继续。"
+            )
+            images = images[:9]
+
         if skipped:
             if images:
                 yield event.plain_result(
-                    f"提示：有 {skipped} 张图片未能解析出可供 Agnes 使用的图片，已忽略，"
+                    f"提示：有 {skipped} 张图片未能解析出可供视频生成使用的图片，已忽略，"
                     "将使用其余图片/URL 继续。"
                 )
             else:
                 yield event.plain_result(
-                    f"有 {skipped} 张图片未能解析出可供 Agnes 使用的图片，且没有其他可用图片或 URL。\n"
+                    f"有 {skipped} 张图片未能解析出可供视频生成使用的图片，且没有其他可用图片或 URL。\n"
                     "如需使用这些图片，请直接粘贴其公开 URL。"
                 )
                 return
@@ -593,7 +685,12 @@ class AgnesVideo(Star):
             aspect = "4:3"
 
         duration = prompt_duration or int(self.config.get("duration_seconds", 5))
-        duration = self._map_duration(duration)
+        if self._provider == "tokendance":
+            duration = max(
+                _H3_MIN_DURATION, min(_H3_MAX_DURATION, duration)
+            )
+        else:
+            duration = self._map_duration(duration)
         payload = self._build_payload(aspect, duration)
 
         if not images:
@@ -605,20 +702,63 @@ class AgnesVideo(Star):
                     "提示词中可指定宽高比（如 16:9）与时长（如 10s）。"
                 )
                 return
-            payload["prompt"] = prompt
+            if self._provider == "tokendance":
+                payload["content"] = [{"type": "text", "text": prompt}]
+            else:
+                payload["prompt"] = prompt
             async for result in self._submit(event, payload, "文生视频"):
                 yield result
             return
 
         if len(images) == 1:
-            payload["prompt"] = prompt or _DEFAULT_I2V_PROMPT
-            payload["image"] = images[0]
+            if self._provider == "tokendance":
+                payload["ratio"] = "adaptive"
+                payload["content"] = [
+                    {"type": "text", "text": prompt or _DEFAULT_I2V_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": images[0]},
+                        "role": "first_frame",
+                    },
+                ]
+            else:
+                payload["prompt"] = prompt or _DEFAULT_I2V_PROMPT
+                payload["image"] = images[0]
             async for result in self._submit(event, payload, "图生视频"):
                 yield result
             return
 
-        payload["prompt"] = prompt or _DEFAULT_KF_PROMPT
-        payload["extra_body"] = {"image": images, "mode": "keyframes"}
+        if self._provider == "tokendance":
+            payload["ratio"] = "adaptive"
+            if len(images) == 2:
+                payload["content"] = [
+                    {"type": "text", "text": prompt or _DEFAULT_KF_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": images[0]},
+                        "role": "first_frame",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": images[1]},
+                        "role": "last_frame",
+                    },
+                ]
+            else:
+                payload["content"] = [
+                    {"type": "text", "text": prompt or _DEFAULT_KF_PROMPT},
+                    *[
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                            "role": "reference_image",
+                        }
+                        for url in images
+                    ],
+                ]
+        else:
+            payload["prompt"] = prompt or _DEFAULT_KF_PROMPT
+            payload["extra_body"] = {"image": images, "mode": "keyframes"}
         async for result in self._submit(event, payload, "关键帧动画"):
             yield result
 
