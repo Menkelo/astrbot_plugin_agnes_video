@@ -104,12 +104,15 @@ class AgnesVideo(Star):
 
     @property
     def _base_url(self) -> str:
-        default = (
-            "https://tokendance.space/gateway/minimax"
-            if self._provider == "tokendance"
-            else "https://apihub.agnes-ai.com"
+        if self._provider == "tokendance":
+            return str(
+                self.config.get(
+                    "tokendance_base_url", "https://tokendance.space/gateway/minimax"
+                )
+            ).rstrip("/")
+        return str(self.config.get("base_url", "https://apihub.agnes-ai.com")).rstrip(
+            "/"
         )
-        return str(self.config.get("base_url", default)).rstrip("/")
 
     def _api_key_ok(self) -> bool:
         return bool(self._keys and self._keys[0])
