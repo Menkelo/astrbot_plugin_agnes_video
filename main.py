@@ -2,6 +2,7 @@ import asyncio
 import ast
 import base64
 import io
+import json
 import os
 import re
 
@@ -391,6 +392,29 @@ class AgnesVideo(Star):
                 logger.debug(f"[AgnesVideo] 图片 URL 重复，已忽略: {url}")
         return urls, saw_image, skipped
 
+    async def _read_json(self, resp: aiohttp.ClientResponse) -> dict:
+        """读取响应体并解析为 dict，兼容空体 / 非 JSON 响应。
+
+        返回解析后的 dict；解析失败或 HTTP >= 400 时抛出带状态码的 RuntimeError，
+        避免 aiohttp 的 JSONDecodeError（如 "Expecting value"）直接暴露给用户。
+        """
+        try:
+            text = await resp.text()
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"HTTP {resp.status}: 读取响应体失败: {e}") from e
+        if not text.strip():
+            raise RuntimeError(f"HTTP {resp.status}: 空响应体")
+        try:
+            data = json.loads(text)
+        except Exception as e:  # noqa: BLE001
+            snippet = text.strip()[:200]
+            raise RuntimeError(
+                f"HTTP {resp.status}: 响应非 JSON（{e}）：{snippet}"
+            ) from e
+        if resp.status >= 400:
+            raise RuntimeError(f"HTTP {resp.status}: {data}")
+        return data
+
     async def _create_task(self, payload: dict) -> dict:
         """创建视频生成任务（使用轮询选出的 API Key）。"""
         if self._provider == "tokendance":
@@ -405,10 +429,7 @@ class AgnesVideo(Star):
                 url, headers=self._headers(api_key), json=payload, timeout=timeout
             ) as resp,
         ):
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                raise RuntimeError(f"HTTP {resp.status}: {data}")
-            return data
+            return await self._read_json(resp)
 
     async def _create_task_retry(self, payload: dict) -> dict:
         """创建视频任务；遇到 429 限流时自动切换到下一个 Key 重试。
@@ -446,10 +467,7 @@ class AgnesVideo(Star):
                     url, headers=self._headers(), timeout=timeout
                 ) as resp,
             ):
-                data = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    raise RuntimeError(f"HTTP {resp.status}: {data}")
-                return data
+                return await self._read_json(resp)
         url = f"{self._base_url}/agnesapi"
         params = {"video_id": video_id}
         async with (
@@ -458,10 +476,7 @@ class AgnesVideo(Star):
                 url, headers=self._headers(), params=params, timeout=timeout
             ) as resp,
         ):
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                raise RuntimeError(f"HTTP {resp.status}: {data}")
-            return data
+            return await self._read_json(resp)
 
     def _extract_video_url(self, data: dict) -> str:
         """从任务响应中提取最终视频 URL。"""
