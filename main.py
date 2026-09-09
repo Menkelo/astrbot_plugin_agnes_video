@@ -1,5 +1,4 @@
 import asyncio
-import ast
 import base64
 import io
 import json
@@ -451,29 +450,6 @@ class AgnesVideo(Star):
         """从任务响应中提取最终视频 URL（completed 后 metadata.url）。"""
         return ((data.get("metadata") or {}).get("url")) or data.get("url") or ""
 
-    @staticmethod
-    def _extract_error_message(err: str) -> str:
-        """从错误字符串中提取简短的错误信息。"""
-        try:
-            parsed = ast.literal_eval(err)
-            if isinstance(parsed, dict):
-                nested = parsed.get("error") if isinstance(parsed.get("error"), dict) else None
-                msg = (nested or parsed).get("message")
-                if isinstance(msg, str):
-                    return msg.strip()[:200]
-        except Exception:  # noqa: BLE001
-            pass
-        m = re.search(r"'message':\s*'([^']*)'", err)
-        if m:
-            return m.group(1).strip()[:200]
-        m = re.search(r"'detail':\s*'([^']*)'", err)
-        if m:
-            return m.group(1).strip()[:200]
-        m = re.search(r"HTTP \d+: (.+)", err)
-        if m:
-            return m.group(1).strip()[:200]
-        return err.strip()[:200]
-
     async def _safe_send(self, umo: str, chain: MessageChain):
         try:
             await self.context.send_message(umo, chain)
@@ -514,11 +490,10 @@ class AgnesVideo(Star):
                 err = str(e)
                 logger.error(f"[AgnesVideo] 查询任务 {video_id} 失败: {err}")
                 if re.search(r"HTTP [45]\d\d", err):
-                    message = self._extract_error_message(err)
                     await self._safe_send(
                         umo,
                         MessageChain().message(
-                            f"视频生成失败：{message or '任务已终止'}，请修改提示词后重试。"
+                            f"视频生成任务查询失败，原始错误：\n{err}"
                         ),
                     )
                     return
