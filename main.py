@@ -483,6 +483,9 @@ class AgnesVideo(Star):
         for attempt in range(2):
             try:
                 await self.context.send_message(umo, chain)
+                logger.info(
+                    f"[AgnesVideo] 视频消息已发送（此链接仅供排查，勿外泄）: {video_url}"
+                )
                 return
             except Exception as e:  # noqa: BLE001
                 logger.warning(
