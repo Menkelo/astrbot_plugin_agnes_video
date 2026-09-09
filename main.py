@@ -23,22 +23,25 @@ except ImportError:
     PILImage = None
 
 _DEFAULT_I2V_PROMPT = "让画面自然运动起来，保持主体、风格和场景一致，电影质感"
-_DEFAULT_KF_PROMPT = "在关键帧之间生成平滑自然的过渡，保持视觉一致和自然的镜头运动"
+_DEFAULT_KF_PROMPT = "在两帧之间生成平滑自然的过渡，保持视觉一致和自然的镜头运动"
+_DEFAULT_REF_PROMPT = "结合附带的参考图片内容与风格生成连贯的视频，保持主体外观与风格一致，电影质感"
 
-_AGNES_RATIOS: dict[str, tuple[int, int]] = {
-    "16:9": (1280, 720),
-    "9:16": (720, 1280),
+_DEFAULT_MODEL = "agnes-video-2.5-flash"
+_DEFAULT_BASE_URL = "https://apihub.agnes-ai.com"
+_SIZE = "720P"
+
+_VIDEO_RATIOS: set[str] = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+_RATIO_DIMS: dict[str, tuple[int, int]] = {
+    "21:9": (2100, 900),
+    "16:9": (1920, 1080),
+    "4:3": (1200, 900),
     "1:1": (1024, 1024),
-    "4:3": (1024, 768),
-    "3:4": (768, 1024),
-    "21:9": (1260, 540),
+    "3:4": (900, 1200),
+    "9:16": (1080, 1920),
 }
-_H3_RATIOS: set[str] = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
-_DURATION_FRAMES: dict[int, int] = {3: 81, 5: 121, 10: 241, 18: 441}
-_DURATION_TIERS = sorted(_DURATION_FRAMES)
-_H3_MIN_DURATION = 4
-_H3_MAX_DURATION = 15
-_FRAME_RATE = 24
+_MIN_SECONDS = 4
+_MAX_SECONDS = 12
+_MAX_REF_IMAGES = 5
 
 _RATIO_RE = re.compile(
     r"(?<!\d)(21\s*[:：]\s*9|16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1|4\s*[:：]\s*3|3\s*[:：]\s*4)(?!\d)",
@@ -58,18 +61,18 @@ def _read_file(path: str) -> bytes:
 
 
 class AgnesVideo(Star):
-    """AI 视频生成插件，支持 Agnes AI Video 与 TokenDance(MiniMax H3) 双提供商。
+    """基于 Agnes AI Video 2.5 Flash 的 AI 视频生成插件。
 
-    根据消息中附带或引用的图片自动选择生成模式：
-    - 无图片：文生视频
-    - 一张图片：图生视频
-    - 两张及以上图片：关键帧动画
+    根据消息中附带或引用的图片数量自动选择生成模式：
+    - 无图片：文生视频（mode=text）
+    - 一张图片：图生视频（mode=keyframe，first_frame）
+    - 两张图片：首尾帧关键帧动画（mode=keyframe，first_frame + last_frame）
+    - 三张及以上：多图参考生成（mode=reference，最多 5 张）
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._provider = str(config.get("provider", "agnes") or "agnes").strip().lower()
         self._tasks: dict[str, asyncio.Task] = {}
         self._keys: list[str] = self._resolve_keys()
         self._key_index = 0
@@ -77,7 +80,7 @@ class AgnesVideo(Star):
     def _resolve_keys(self) -> list[str]:
         """解析 API Key 列表（`api_keys`，每项一个 Key）。
 
-        多个 Key 时插件会轮询使用，绕过每分钟 1 个视频任务的限流。
+        多个 Key 时插件会轮询使用，规避单 Key 限流。
         """
         keys: list[str] = []
         for k in self.config.get("api_keys") or []:
@@ -104,54 +107,34 @@ class AgnesVideo(Star):
 
     @property
     def _base_url(self) -> str:
-        if self._provider == "tokendance":
-            return str(
-                self.config.get(
-                    "tokendance_base_url", "https://tokendance.space/gateway/minimax"
-                )
-            ).rstrip("/")
-        return str(self.config.get("base_url", "https://apihub.agnes-ai.com")).rstrip(
-            "/"
-        )
+        return str(self.config.get("base_url", _DEFAULT_BASE_URL)).rstrip("/")
+
+    @property
+    def _model(self) -> str:
+        return str(self.config.get("model", _DEFAULT_MODEL) or _DEFAULT_MODEL).strip()
 
     def _api_key_ok(self) -> bool:
         return bool(self._keys and self._keys[0])
 
     def _build_payload(
-        self, aspect_ratio: str, duration_seconds: int
+        self, mode: str, aspect_ratio: str, seconds: int
     ) -> dict:
-        """根据宽高比与时长构建视频生成公共参数。
-
-        不同提供商参数结构不同：
-        - agnes：width/height/num_frames/frame_rate 的显式像素与帧数配置。
-        - tokendance(MiniMax H3)：resolution/duration/ratio，宽高比由模型按档位处理。
+        """构建 Agnes Video 2.5 Flash 的任务请求公共参数。
 
         Args:
-            aspect_ratio: 宽高比，如 16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 21:9。
-            duration_seconds: 目标时长（秒）。
+            mode: text / keyframe / reference。
+            aspect_ratio: 输出宽高比，如 16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 21:9。
+            seconds: 目标时长（秒），会被钳制到 4-12。
 
         Returns:
-            公共参数 dict。
+            公共参数 dict（不含媒体与 prompt，由调用方补充）。
         """
-        if self._provider == "tokendance":
-            params = {
-                "model": str(self.config.get("tokendance_model", "minimax-h3")),
-                "resolution": str(self.config.get("resolution", "768P")),
-                "duration": max(
-                    _H3_MIN_DURATION,
-                    min(_H3_MAX_DURATION, duration_seconds),
-                ),
-                "ratio": aspect_ratio if aspect_ratio in _H3_RATIOS else "16:9",
-            }
-            return params
-        width, height = _AGNES_RATIOS.get(aspect_ratio, _AGNES_RATIOS["4:3"])
-        num_frames = _DURATION_FRAMES.get(duration_seconds, 121)
         params = {
-            "model": str(self.config.get("model", "agnes-video-v2.0")),
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": _FRAME_RATE,
+            "model": self._model,
+            "mode": mode,
+            "seconds": str(max(_MIN_SECONDS, min(_MAX_SECONDS, seconds))),
+            "size": _SIZE,
+            "aspect_ratio": aspect_ratio if aspect_ratio in _VIDEO_RATIOS else "16:9",
         }
         seed = int(self.config.get("seed", -1))
         if seed >= 0:
@@ -196,18 +179,13 @@ class AgnesVideo(Star):
         return text, aspect, duration
 
     @staticmethod
-    def _map_duration(seconds: int) -> int:
-        """将目标秒数映射到最接近的支持时长档位。"""
-        return min(_DURATION_TIERS, key=lambda t: abs(t - seconds))
-
-    @staticmethod
     def _map_ratio(ratio: float) -> str | None:
         """将图片宽高比映射到最接近的支持比例。"""
         if not ratio or ratio <= 0:
             return None
         return min(
-            _AGNES_RATIOS,
-            key=lambda ar: abs((_AGNES_RATIOS[ar][0] / _AGNES_RATIOS[ar][1]) - ratio),
+            _RATIO_DIMS,
+            key=lambda ar: abs((_RATIO_DIMS[ar][0] / _RATIO_DIMS[ar][1]) - ratio),
         )
 
     async def _detect_image_ratio(self, ref: str) -> float | None:
@@ -337,8 +315,7 @@ class AgnesVideo(Star):
         """将图片转换为 Data URI Base64，作为无法获得公开 URL 时的兜底。
 
         适用于 aiocqhttp 协议端未下发图片链接、仅提供本地文件路径的场景。
-        Agnes 图生视频 / 关键帧的 image 参数接受可公开访问的 URL 或
-        Data URI Base64（Image API 明确支持，Video API 兼容该约定）。
+        Agnes Video 2.5 的图片参数接受公开 URL 或 Data URI Base64。
         """
         try:
             b64 = await img.convert_to_base64()
@@ -420,10 +397,7 @@ class AgnesVideo(Star):
 
     async def _create_task(self, payload: dict) -> dict:
         """创建视频生成任务（使用轮询选出的 API Key）。"""
-        if self._provider == "tokendance":
-            url = f"{self._base_url}/v2/video_generation"
-        else:
-            url = f"{self._base_url}/v1/videos"
+        url = f"{self._base_url}/v1/videos"
         timeout = aiohttp.ClientTimeout(total=60)
         api_key = self._next_key()
         async with (
@@ -458,21 +432,12 @@ class AgnesVideo(Star):
     async def _query_task(self, video_id: str) -> dict:
         """查询视频生成任务状态。
 
-        - agnes：GET {base}/agnesapi?video_id=...（推荐方式）。
-        - tokendance(MiniMax H3)：GET {base}/v2/query/video_generation/{task_id}。
+        GET {base}/agnesapi?video_id=...&model_name=agnes-video-2.5-flash
+        （携带 model_name 以兼容 keyframe / reference 模式的任务查询）。
         """
-        timeout = aiohttp.ClientTimeout(total=60)
-        if self._provider == "tokendance":
-            url = f"{self._base_url}/v2/query/video_generation/{video_id}"
-            async with (
-                aiohttp.ClientSession() as session,
-                session.get(
-                    url, headers=self._headers(), timeout=timeout
-                ) as resp,
-            ):
-                return await self._read_json(resp)
         url = f"{self._base_url}/agnesapi"
-        params = {"video_id": video_id}
+        params = {"video_id": video_id, "model_name": self._model}
+        timeout = aiohttp.ClientTimeout(total=60)
         async with (
             aiohttp.ClientSession() as session,
             session.get(
@@ -481,10 +446,9 @@ class AgnesVideo(Star):
         ):
             return await self._read_json(resp)
 
-    def _extract_video_url(self, data: dict) -> str:
-        """从任务响应中提取最终视频 URL。"""
-        if self._provider == "tokendance":
-            return ((data.get("task") or {}).get("content") or {}).get("url") or ""
+    @staticmethod
+    def _extract_video_url(data: dict) -> str:
+        """从任务响应中提取最终视频 URL（completed 后 metadata.url）。"""
         return ((data.get("metadata") or {}).get("url")) or data.get("url") or ""
 
     @staticmethod
@@ -500,6 +464,9 @@ class AgnesVideo(Star):
         except Exception:  # noqa: BLE001
             pass
         m = re.search(r"'message':\s*'([^']*)'", err)
+        if m:
+            return m.group(1).strip()[:200]
+        m = re.search(r"'detail':\s*'([^']*)'", err)
         if m:
             return m.group(1).strip()[:200]
         m = re.search(r"HTTP \d+: (.+)", err)
@@ -559,47 +526,25 @@ class AgnesVideo(Star):
                 elapsed += poll_interval
                 continue
             status = data.get("status")
-            if self._provider == "tokendance":
-                status = (data.get("task") or {}).get("status")
-                if status == "succeeded":
-                    video_url = self._extract_video_url(data)
-                    if video_url:
-                        await self._deliver_video(umo, video_url)
-                    else:
-                        await self._safe_send(
-                            umo,
-                            MessageChain().message(
-                                "视频生成完成，但响应中未找到视频链接。"
-                            ),
-                        )
-                    return
-                if status in ("failed", "cancelled", "expired"):
-                    task = data.get("task") or {}
-                    err = (task.get("error") or {}).get("message") or "任务已终止"
+            if status == "completed":
+                video_url = self._extract_video_url(data)
+                if video_url:
+                    await self._deliver_video(umo, video_url)
+                else:
                     await self._safe_send(
                         umo,
-                        MessageChain().message(f"视频生成失败：{err}"),
+                        MessageChain().message(
+                            "视频生成完成，但响应中未找到视频链接。"
+                        ),
                     )
-                    return
-            else:
-                if status == "completed":
-                    video_url = self._extract_video_url(data)
-                    if video_url:
-                        await self._deliver_video(umo, video_url)
-                    else:
-                        await self._safe_send(
-                            umo,
-                            MessageChain().message(
-                                "视频生成完成，但响应中未找到视频链接。"
-                            ),
-                        )
-                    return
-                if status == "failed":
-                    await self._safe_send(
-                        umo,
-                        MessageChain().message(f"视频生成失败：{data.get('error')}"),
-                    )
-                    return
+                return
+            if status == "failed":
+                err = (data.get("error") or {}).get("message") or "任务已终止"
+                await self._safe_send(
+                    umo,
+                    MessageChain().message(f"视频生成失败：{err}"),
+                )
+                return
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
         await self._safe_send(
@@ -613,9 +558,8 @@ class AgnesVideo(Star):
     async def _submit(self, event: AstrMessageEvent, payload: dict, mode_desc: str):
         """创建任务并启动后台轮询。"""
         if not self._api_key_ok():
-            provider_name = "TokenDance" if self._provider == "tokendance" else "Agnes"
             yield event.plain_result(
-                f"未配置 {provider_name} API Key，请在插件配置中填写 api_keys 列表。"
+                "未配置 Agnes API Key，请在插件配置中填写 api_keys 列表。"
             )
             return
         try:
@@ -623,16 +567,10 @@ class AgnesVideo(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"[AgnesVideo] 创建任务失败: {e}")
             if "HTTP 429" in str(e):
-                if self._provider == "tokendance":
-                    hint = (
-                        "触发了 TokenDance 网关或上游供应商限流（HTTP 429），"
-                        "若配置了多个 Key 已自动轮换，请稍后重试。"
-                    )
-                else:
-                    hint = (
-                        "Agnes 限制每个 API Key 每分钟最多创建 1 个视频任务，"
-                        "若配置了多个 Key 已自动轮换，请等待约 1 分钟后再试。"
-                    )
+                hint = (
+                    "触发了 Agnes API 限流（HTTP 429），"
+                    "若配置了多个 Key 已自动轮换，请稍后重试。"
+                )
                 yield event.plain_result(f"{mode_desc}任务创建失败：{hint}")
             else:
                 yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
@@ -653,7 +591,7 @@ class AgnesVideo(Star):
 
     @filter.command("vgen")
     async def vgen(self, event: AstrMessageEvent, text: GreedyStr):
-        """AI 视频生成。发消息时附带图片或引用含图片的消息，自动切换生成模式。"""
+        """AI 视频生成（Agnes Video 2.5 Flash）。发消息时附带图片或引用含图片的消息，自动切换生成模式。"""
         text = text.strip()
 
         images, saw_image, skipped = await self._collect_images(event)
@@ -673,12 +611,12 @@ class AgnesVideo(Star):
         clean_text = re.sub(r"https?://\S+", "", text).strip()
         prompt, prompt_aspect, prompt_duration = self._extract_prompt_meta(clean_text)
 
-        if self._provider == "tokendance" and len(images) > 9:
+        if len(images) > _MAX_REF_IMAGES:
             yield event.plain_result(
-                f"提示：MiniMax H3 单次最多使用 9 张参考图片，已截断至前 9 张，"
-                "将使用其余参数继续。"
+                f"提示：agnes-video-2.5-flash 单次最多使用 {_MAX_REF_IMAGES} 张参考图片，"
+                f"已截断至前 {_MAX_REF_IMAGES} 张，将使用其余参数继续。"
             )
-            images = images[:9]
+            images = images[:_MAX_REF_IMAGES]
 
         if skipped:
             if images:
@@ -698,86 +636,49 @@ class AgnesVideo(Star):
             ratio = await self._detect_image_ratio(images[0])
             aspect = self._map_ratio(ratio) if ratio else None
         if not aspect:
-            aspect = str(self.config.get("aspect_ratio", "4:3"))
-        if aspect not in _AGNES_RATIOS:
-            aspect = "4:3"
+            aspect = str(self.config.get("aspect_ratio", "16:9"))
+        if aspect not in _VIDEO_RATIOS:
+            aspect = "16:9"
 
         duration = prompt_duration or int(self.config.get("duration_seconds", 5))
-        if self._provider == "tokendance":
-            duration = max(
-                _H3_MIN_DURATION, min(_H3_MAX_DURATION, duration)
-            )
-        else:
-            duration = self._map_duration(duration)
-        payload = self._build_payload(aspect, duration)
 
         if not images:
             if not prompt:
                 yield event.plain_result(
                     "用法：/vgen <提示词>\n"
-                    "发消息时附带图片可进行图生视频；"
-                    "引用含两张及以上图片的消息可进行关键帧动画。\n"
-                    "提示词中可指定宽高比（如 16:9）与时长（如 10s）。"
+                    "发消息时附带一张图片可进行图生视频；"
+                    "两张图片进行首尾帧关键帧动画；"
+                    "三张及以上进行多图参考生成。\n"
+                    "提示词中可指定宽高比（如 16:9）与时长（如 10s，支持 4-12 秒）。"
                 )
                 return
-            if self._provider == "tokendance":
-                payload["content"] = [{"type": "text", "text": prompt}]
-            else:
-                payload["prompt"] = prompt
+            payload = self._build_payload("text", aspect, duration)
+            payload["prompt"] = prompt
             async for result in self._submit(event, payload, "文生视频"):
                 yield result
             return
 
         if len(images) == 1:
-            if self._provider == "tokendance":
-                payload["ratio"] = "adaptive"
-                payload["content"] = [
-                    {"type": "text", "text": prompt or _DEFAULT_I2V_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": images[0]},
-                        "role": "first_frame",
-                    },
-                ]
-            else:
-                payload["prompt"] = prompt or _DEFAULT_I2V_PROMPT
-                payload["image"] = images[0]
+            payload = self._build_payload("keyframe", aspect, duration)
+            payload["prompt"] = prompt or _DEFAULT_I2V_PROMPT
+            payload["first_frame"] = images[0]
             async for result in self._submit(event, payload, "图生视频"):
                 yield result
             return
 
-        if self._provider == "tokendance":
-            payload["ratio"] = "adaptive"
-            if len(images) == 2:
-                payload["content"] = [
-                    {"type": "text", "text": prompt or _DEFAULT_KF_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": images[0]},
-                        "role": "first_frame",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": images[1]},
-                        "role": "last_frame",
-                    },
-                ]
-            else:
-                payload["content"] = [
-                    {"type": "text", "text": prompt or _DEFAULT_KF_PROMPT},
-                    *[
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": url},
-                            "role": "reference_image",
-                        }
-                        for url in images
-                    ],
-                ]
-        else:
+        if len(images) == 2:
+            payload = self._build_payload("keyframe", aspect, duration)
             payload["prompt"] = prompt or _DEFAULT_KF_PROMPT
-            payload["extra_body"] = {"image": images, "mode": "keyframes"}
-        async for result in self._submit(event, payload, "关键帧动画"):
+            payload["first_frame"] = images[0]
+            payload["last_frame"] = images[1]
+            async for result in self._submit(event, payload, "首尾帧关键帧动画"):
+                yield result
+            return
+
+        payload = self._build_payload("reference", aspect, duration)
+        payload["prompt"] = prompt or _DEFAULT_REF_PROMPT
+        payload["images"] = images
+        async for result in self._submit(event, payload, "多图参考生成"):
             yield result
 
     async def terminate(self):
