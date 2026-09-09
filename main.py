@@ -478,10 +478,8 @@ class AgnesVideo(Star):
             logger.error(f"[AgnesVideo] 主动发送消息失败: {e}")
 
     async def _deliver_video(self, umo: str, video_url: str, reply_id: str = ""):
-        """直接发送视频消息（带引用）；失败重试一次，仍失败则只给简短提示。"""
+        """直接发送视频消息（不带引用）；失败重试一次，仍失败则给出带引用的简短提示。"""
         chain = MessageChain(chain=[Video.fromURL(url=video_url)])
-        if reply_id:
-            chain.chain.insert(0, Reply(id=reply_id))
         for attempt in range(2):
             try:
                 await self.context.send_message(umo, chain)
