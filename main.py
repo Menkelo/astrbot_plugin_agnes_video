@@ -450,19 +450,41 @@ class AgnesVideo(Star):
         """从任务响应中提取最终视频 URL（completed 后 metadata.url）。"""
         return ((data.get("metadata") or {}).get("url")) or data.get("url") or ""
 
+    @staticmethod
+    def _message_id(event: AstrMessageEvent) -> str:
+        """从事件中提取被触发消息的 ID，用于构造 Reply 引用。"""
+        try:
+            mid = getattr(event.message_obj, "message_id", "")
+            return str(mid) if mid else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _quoted_chain(text: str, reply_id: str = "") -> MessageChain:
+        """构造文本消息链；reply_id 非空时在消息首部插入 Reply 引用。"""
+        chain = MessageChain().message(text)
+        if reply_id:
+            chain.chain.insert(0, Reply(id=reply_id))
+        return chain
+
+    def _quoted_result(self, event: AstrMessageEvent, text: str):
+        """构造同步回复结果（yield 用），自动引用触发原消息。"""
+        return event.chain_result(self._quoted_chain(text, self._message_id(event)).chain)
+
     async def _safe_send(self, umo: str, chain: MessageChain):
         try:
             await self.context.send_message(umo, chain)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[AgnesVideo] 主动发送消息失败: {e}")
 
-    async def _deliver_video(self, umo: str, video_url: str):
-        """直接发送视频消息；失败重试一次，仍失败则只给简短提示。"""
+    async def _deliver_video(self, umo: str, video_url: str, reply_id: str = ""):
+        """直接发送视频消息（带引用）；失败重试一次，仍失败则只给简短提示。"""
+        chain = MessageChain(chain=[Video.fromURL(url=video_url)])
+        if reply_id:
+            chain.chain.insert(0, Reply(id=reply_id))
         for attempt in range(2):
             try:
-                await self.context.send_message(
-                    umo, MessageChain(chain=[Video.fromURL(url=video_url)])
-                )
+                await self.context.send_message(umo, chain)
                 return
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -473,12 +495,13 @@ class AgnesVideo(Star):
         logger.info(f"[AgnesVideo] 视频发送失败，下载链接（仅供排查）: {video_url}")
         await self._safe_send(
             umo,
-            MessageChain().message(
-                "视频生成完成，但当前消息平台发送视频失败，请稍后重试。"
+            self._quoted_chain(
+                "视频生成完成，但当前消息平台发送视频失败，请稍后重试。",
+                reply_id,
             ),
         )
 
-    async def _poll_and_deliver(self, video_id: str, umo: str):
+    async def _poll_and_deliver(self, video_id: str, umo: str, reply_id: str = ""):
         """后台轮询任务，完成后将视频推送给用户。"""
         max_poll_time = int(self.config.get("max_poll_time", 600))
         poll_interval = int(self.config.get("poll_interval", 5))
@@ -492,8 +515,8 @@ class AgnesVideo(Star):
                 if re.search(r"HTTP [45]\d\d", err):
                     await self._safe_send(
                         umo,
-                        MessageChain().message(
-                            f"视频生成任务查询失败，原始错误：\n{err}"
+                        self._quoted_chain(
+                            f"视频生成任务查询失败，原始错误：\n{err}", reply_id
                         ),
                     )
                     return
@@ -504,12 +527,12 @@ class AgnesVideo(Star):
             if status == "completed":
                 video_url = self._extract_video_url(data)
                 if video_url:
-                    await self._deliver_video(umo, video_url)
+                    await self._deliver_video(umo, video_url, reply_id)
                 else:
                     await self._safe_send(
                         umo,
-                        MessageChain().message(
-                            "视频生成完成，但响应中未找到视频链接。"
+                        self._quoted_chain(
+                            "视频生成完成，但响应中未找到视频链接。", reply_id
                         ),
                     )
                 return
@@ -517,24 +540,25 @@ class AgnesVideo(Star):
                 err = (data.get("error") or {}).get("message") or "任务已终止"
                 await self._safe_send(
                     umo,
-                    MessageChain().message(f"视频生成失败：{err}"),
+                    self._quoted_chain(f"视频生成失败：{err}", reply_id),
                 )
                 return
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
         await self._safe_send(
             umo,
-            MessageChain().message(
+            self._quoted_chain(
                 f"视频生成时间超过预期（>{max_poll_time}s），仍在后台生成中，"
-                "完成后将自动发送视频，请稍候。"
+                "完成后将自动发送视频，请稍候。",
+                reply_id,
             ),
         )
 
     async def _submit(self, event: AstrMessageEvent, payload: dict, mode_desc: str):
         """创建任务并启动后台轮询。"""
         if not self._api_key_ok():
-            yield event.plain_result(
-                "未配置 Agnes API Key，请在插件配置中填写 api_keys 列表。"
+            yield self._quoted_result(
+                event, "未配置 Agnes API Key，请在插件配置中填写 api_keys 列表。"
             )
             return
         try:
@@ -546,20 +570,26 @@ class AgnesVideo(Star):
                     "触发了 Agnes API 限流（HTTP 429），"
                     "若配置了多个 Key 已自动轮换，请稍后重试。"
                 )
-                yield event.plain_result(f"{mode_desc}任务创建失败：{hint}")
+                yield self._quoted_result(event, f"{mode_desc}任务创建失败：{hint}")
             else:
-                yield event.plain_result(f"{mode_desc}任务创建失败：{e}")
+                yield self._quoted_result(
+                    event, f"{mode_desc}任务创建失败：{e}"
+                )
             return
         video_id = data.get("video_id") or data.get("task_id") or data.get("id")
         if not video_id:
-            yield event.plain_result(f"创建任务失败：响应中缺少任务 ID。{data}")
+            yield self._quoted_result(
+                event, f"创建任务失败：响应中缺少任务 ID。{data}"
+            )
             return
         umo = event.unified_msg_origin
+        reply_id = self._message_id(event)
         self._tasks[video_id] = asyncio.get_running_loop().create_task(
-            self._poll_and_deliver(video_id, umo)
+            self._poll_and_deliver(video_id, umo, reply_id)
         )
-        yield event.plain_result(
-            f"{mode_desc}任务已创建，正在生成中，完成后将自动发送视频，请稍候……"
+        yield self._quoted_result(
+            event,
+            f"{mode_desc}任务已创建，正在生成中，完成后将自动发送视频，请稍候……",
         )
 
     # ============================== 命令 ==============================
@@ -571,11 +601,12 @@ class AgnesVideo(Star):
 
         images, saw_image, skipped = await self._collect_images(event)
         if saw_image and not images:
-            yield event.plain_result(
+            yield self._quoted_result(
+                event,
                 "已检测到图片，但未能解析出可供视频生成使用的图片（URL 或 base64）。\n"
                 "已尝试组件 URL、协议端 get_image、AstrBot 文件服务以及本地 base64 转换，均未成功"
                 "（详见 AstrBot 日志中的 AgnesVideo 提示）。\n"
-                "也可以在命令中直接粘贴可公开访问的图片 URL。"
+                "也可以在命令中直接粘贴可公开访问的图片 URL。",
             )
             return
 
@@ -587,22 +618,25 @@ class AgnesVideo(Star):
         prompt, prompt_aspect, prompt_duration = self._extract_prompt_meta(clean_text)
 
         if len(images) > _MAX_REF_IMAGES:
-            yield event.plain_result(
+            yield self._quoted_result(
+                event,
                 f"提示：agnes-video-2.5-flash 单次最多使用 {_MAX_REF_IMAGES} 张参考图片，"
-                f"已截断至前 {_MAX_REF_IMAGES} 张，将使用其余参数继续。"
+                f"已截断至前 {_MAX_REF_IMAGES} 张，将使用其余参数继续。",
             )
             images = images[:_MAX_REF_IMAGES]
 
         if skipped:
             if images:
-                yield event.plain_result(
+                yield self._quoted_result(
+                    event,
                     f"提示：有 {skipped} 张图片未能解析出可供视频生成使用的图片，已忽略，"
-                    "将使用其余图片/URL 继续。"
+                    "将使用其余图片/URL 继续。",
                 )
             else:
-                yield event.plain_result(
+                yield self._quoted_result(
+                    event,
                     f"有 {skipped} 张图片未能解析出可供视频生成使用的图片，且没有其他可用图片或 URL。\n"
-                    "如需使用这些图片，请直接粘贴其公开 URL。"
+                    "如需使用这些图片，请直接粘贴其公开 URL。",
                 )
                 return
 
@@ -619,12 +653,13 @@ class AgnesVideo(Star):
 
         if not images:
             if not prompt:
-                yield event.plain_result(
+                yield self._quoted_result(
+                    event,
                     "用法：/vgen <提示词>\n"
                     "发消息时附带一张图片可进行图生视频；"
                     "两张图片进行首尾帧关键帧动画；"
                     "三张及以上进行多图参考生成。\n"
-                    "提示词中可指定宽高比（如 16:9）与时长（如 10s，支持 4-12 秒）。"
+                    "提示词中可指定宽高比（如 16:9）与时长（如 10s，支持 4-12 秒）。",
                 )
                 return
             payload = self._build_payload("text", aspect, duration)
